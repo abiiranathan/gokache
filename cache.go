@@ -2,39 +2,59 @@ package gokache
 
 import (
 	"encoding/gob"
-	"hash/fnv"
 	"os"
 	"sync"
 	"time"
 )
 
-// CacheEntry represents a cached item with its value and expiration time.
-// A zero Expiration means the entry does not expire.
+// CacheEntry represents a single item stored within the cache, encapsulating 
+// both the actual data and its specific time-to-live.
 type CacheEntry struct {
-	Value      any       // The value stored in the cache
-	Expiration time.Time // The expiration time of the entry. Zero means no expiration
+	// Value is the actual data stored in the cache. Being of type `any`, it can hold any Go data type.
+	// NOTE: If you plan to use SaveToDisk/LoadFromDisk, any custom struct types stored here 
+	// MUST be registered using gob.Register(MyStruct{}) in your application's init() function.
+	Value any
+
+	// Expiration represents the exact date and time when this entry becomes stale.
+	// A zero-value time.Time indicates that the entry never expires.
+	Expiration time.Time
 }
 
-// shard represents a single shard of the cache.
-// Each shard is a map of string keys to CacheEntry values.
-// It uses a read-write mutex to allow concurrent access.
+// shard represents a fractional segment of the overall cache.
+// Sharding minimizes thread contention by distributing locks across multiple map instances
+// rather than locking the entire cache during concurrent read/write operations.
 type shard struct {
-	items map[string]CacheEntry // Map of keys to CacheEntry values
-	mu    sync.RWMutex          // Read-write mutex for concurrent access
+	// items is the underlying map storing the cached key-value pairs for this specific shard.
+	items map[string]CacheEntry
+
+	// mu is a Read-Write mutex that safely controls concurrent access to the items map.
+	// It allows multiple simultaneous readers but strictly one writer.
+	mu sync.RWMutex
 }
 
-// Cache is a scalable in-memory cache with TTL support.
-// It uses sharding to improve performance and reduce contention.
+// Cache is a scalable, highly-concurrent in-memory key-value store with TTL (Time-To-Live) support.
+// It relies on a sharded map architecture to reduce lock contention and includes an automated 
+// background garbage collector for expired keys.
 type Cache struct {
-	shards          []*shard      // Array of shards for sharding
-	ttl             time.Duration // Default time-to-live for entries
-	cleanupInterval time.Duration // Interval for background cleanup of expired items
-	closeCh         chan struct{} // Channel to signal cleanup goroutine to stop
+	// shards is a fixed-size array of map segments. Keys are hashed to determine their corresponding shard.
+	shards []*shard
+
+	// ttl defines the default expiration duration for newly added items if no specific TTL is provided.
+	ttl time.Duration
+
+	// cleanupInterval dictates how frequently the background garbage collector scans for and deletes expired items.
+	cleanupInterval time.Duration
+
+	// closeCh is a channel used to send a termination signal to the background cleanup goroutine.
+	closeCh chan struct{}
+
+	// closeOnce ensures that the closeCh channel is closed exactly once to prevent runtime panics.
+	closeOnce sync.Once
 }
 
-// NewCache creates a new Cache instance with configurable sharding.
-// ttl: Default time-to-live for entries (<=0 means no expiration)
-// cleanupInterval: Interval for background cleanup (0 disables cleanup)
+// NewCache instantiates and returns a new Cache instance with a fixed number of shards (256).
+// ttl determines the default time-to-live for entries (<= 0 implies no expiration).
+// cleanupInterval sets the frequency of the background eviction process (0 disables the background process).
 func NewCache(ttl time.Duration, cleanupInterval time.Duration) *Cache {
 	const numShards = 256
 	shards := make([]*shard, numShards)
@@ -57,18 +77,24 @@ func NewCache(ttl time.Duration, cleanupInterval time.Duration) *Cache {
 	return c
 }
 
+// getShard calculates the FNV-1a hash of the provided string key inline and returns the specific 
+// shard responsible for storing or retrieving this key. 
+// This custom implementation ensures zero heap allocations compared to hash/fnv.
 func (c *Cache) getShard(key string) *shard {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return c.shards[h.Sum32()%uint32(len(c.shards))]
+	var hash uint32 = 2166136261 // FNV offset basis
+	for i := 0; i < len(key); i++ {
+		hash ^= uint32(key[i])
+		hash *= 16777619 // FNV prime
+	}
+	return c.shards[hash%uint32(len(c.shards))]
 }
 
-// Set adds a value with the default TTL.
+// Set adds a new key-value pair to the cache, applying the Cache instance's default TTL.
 func (c *Cache) Set(key string, value any) {
 	c.SetWithTTL(key, value, c.ttl)
 }
 
-// SetWithTTL adds a value with custom TTL.
+// SetWithTTL adds a new key-value pair to the cache with a custom, item-specific TTL.
 func (c *Cache) SetWithTTL(key string, value any, ttl time.Duration) {
 	shard := c.getShard(key)
 	var exp time.Time
@@ -81,7 +107,9 @@ func (c *Cache) SetWithTTL(key string, value any, ttl time.Duration) {
 	shard.mu.Unlock()
 }
 
-// Get retrieves an item if available and not expired.
+// Get attempts to retrieve an item from the cache using its key.
+// It returns the value and a boolean indicating success. If the item is found but has expired, 
+// it proactively deletes the item and returns false.
 func (c *Cache) Get(key string) (any, bool) {
 	shard := c.getShard(key)
 
@@ -93,21 +121,22 @@ func (c *Cache) Get(key string) (any, bool) {
 		return nil, false
 	}
 
+	// Passive expiration check: if the entry is expired, explicitly delete it and return false.
 	if !entry.Expiration.IsZero() && time.Now().After(entry.Expiration) {
 		shard.mu.Lock()
-		defer shard.mu.Unlock()
-		// Double-check under write lock
-		if entry, ok = shard.items[key]; ok &&
-			!entry.Expiration.IsZero() && time.Now().After(entry.Expiration) {
+		// Double-check under write lock to ensure another goroutine hasn't updated the entry
+		if entry, ok = shard.items[key]; ok && !entry.Expiration.IsZero() && time.Now().After(entry.Expiration) {
 			delete(shard.items, key)
+			shard.mu.Unlock()
 			return nil, false
 		}
+		shard.mu.Unlock()
 	}
 
 	return entry.Value, true
 }
 
-// Delete removes an item from the cache.
+// Delete explicitly removes an item from the cache using its key.
 func (c *Cache) Delete(key string) {
 	shard := c.getShard(key)
 	shard.mu.Lock()
@@ -115,7 +144,7 @@ func (c *Cache) Delete(key string) {
 	shard.mu.Unlock()
 }
 
-// Size returns the total number of items in the cache.
+// Size aggregates and returns the total number of items currently stored across all shards.
 func (c *Cache) Size() int {
 	size := 0
 	for _, s := range c.shards {
@@ -126,17 +155,22 @@ func (c *Cache) Size() int {
 	return size
 }
 
-// Close stops the background cleanup goroutine.
+// Close gracefully shuts down the background cleanup goroutine.
+// It uses sync.Once to ensure it can be safely called multiple times without panicking.
+// If the background cleanup was disabled, it immediately purges expired items synchronously.
 func (c *Cache) Close() {
-	close(c.closeCh)
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
 
-	// Signal the cleanup goroutine to stop
-	if c.cleanupInterval <= 0 {
-		// no go routine to stop but we need to clean up
-		c.deleteExpiredItems()
-	}
+		// Signal the cleanup goroutine to stop; if no goroutine, clean up directly
+		if c.cleanupInterval <= 0 {
+			c.deleteExpiredItems()
+		}
+	})
 }
 
+// cleanupExpiredItems is a blocking background worker that periodically scans for and purges 
+// expired items based on the cleanupInterval.
 func (c *Cache) cleanupExpiredItems() {
 	ticker := time.NewTicker(c.cleanupInterval)
 	defer ticker.Stop()
@@ -151,6 +185,7 @@ func (c *Cache) cleanupExpiredItems() {
 	}
 }
 
+// deleteExpiredItems iterates through all shards and deletes any keys that have passed their expiration time.
 func (c *Cache) deleteExpiredItems() {
 	now := time.Now()
 	for _, s := range c.shards {
@@ -164,28 +199,41 @@ func (c *Cache) deleteExpiredItems() {
 	}
 }
 
-// SaveToDisk saves the cache to a file using gob encoding.
+// SaveToDisk serializes the entire cache state and writes it to the specified file path using the gob encoder.
+// It writes to a temporary file first and performs an atomic rename to prevent file corruption in case of a crash.
+// Note: Custom structs stored as `any` must be registered via `gob.Register()` beforehand.
 func (c *Cache) SaveToDisk(path string) error {
-	file, err := os.Create(path)
+	tempPath := path + ".tmp"
+	file, err := os.Create(tempPath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
 	encoder := gob.NewEncoder(file)
 	for _, s := range c.shards {
 		s.mu.RLock()
-		if err := encoder.Encode(s.items); err != nil {
-			s.mu.RUnlock()
+		err := encoder.Encode(s.items)
+		s.mu.RUnlock()
+		
+		if err != nil {
+			file.Close()
+			os.Remove(tempPath)
 			return err
 		}
-		s.mu.RUnlock()
 	}
-	return nil
 
+	// Ensure the file is successfully flushed and closed before renaming
+	if err := file.Close(); err != nil {
+		os.Remove(tempPath)
+		return err
+	}
+
+	// Atomically replace the old cache file with the new one
+	return os.Rename(tempPath, path)
 }
 
-// LoadFromDisk loads the cache from a file using gob decoding.
+// LoadFromDisk reads and deserializes the cache state from the specified file path using the gob decoder.
+// Note: Custom structs stored as `any` must be registered via `gob.Register()` beforehand.
 func (c *Cache) LoadFromDisk(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -196,11 +244,12 @@ func (c *Cache) LoadFromDisk(path string) error {
 	decoder := gob.NewDecoder(file)
 	for _, s := range c.shards {
 		s.mu.Lock()
-		if err := decoder.Decode(&s.items); err != nil {
-			s.mu.Unlock()
+		err := decoder.Decode(&s.items)
+		s.mu.Unlock()
+		
+		if err != nil {
 			return err
 		}
-		s.mu.Unlock()
 	}
 	return nil
 }

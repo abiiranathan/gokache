@@ -183,25 +183,36 @@ func BenchmarkCacheGet(b *testing.B) {
 	c := NewCache(time.Minute, 0)
 	c.Set("key", "value")
 
+	b.ReportAllocs()
+	b.ResetTimer()
 	for b.Loop() {
 		c.Get("key")
 	}
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "reads/sec")
 }
 
 func BenchmarkCacheSet(b *testing.B) {
 	c := NewCache(time.Minute, 0)
 
+	b.ReportAllocs()
+	b.ResetTimer()
 	for b.Loop() {
 		c.Set("key", "value")
 	}
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "writes/sec")
 }
 
 func BenchmarkCacheConcurrent(b *testing.B) {
 	c := NewCache(time.Minute, 0)
+
+	b.ReportAllocs()
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			c.Set("key", "value")
 			c.Get("key")
 		}
 	})
+	ops := float64(b.N * 2) // Each iteration does 1 Set + 1 Get
+	b.ReportMetric(ops/b.Elapsed().Seconds(), "ops/sec")
 }
